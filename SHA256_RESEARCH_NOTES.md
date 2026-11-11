@@ -1,288 +1,143 @@
-# SHA-256 Reverse Engineering Research Notes
+# SHA-256 Reverse Engineering Research
 
-## 1. Project Objective
+## Project Overview
 
-The objective of this project is to investigate whether we can use the internal mathematical structure of SHA-256, combined with an SMT solver, to find a four-byte unknown value `X` satisfying a configurable trailing-zero condition.
+This project explores whether the internal operations of SHA-256 can be modeled symbolically and constrained mathematically to find an unknown input.
 
-The target expression is:
+The goal is to find a four-byte value `X` such that:
 
 ```text
 SHA256(SHA256(B || X))
 ```
 
-Where:
+produces a digest with a configurable number of trailing zero bits.
 
-- `B` is a fixed, known 80-byte input.
-- `X` is an unknown, exactly 4-byte value (32 unknown bits).
-- The resulting double SHA-256 digest must have a specified number of trailing zero bits.
+The project is intentionally **not intended to use brute force**. Instead, it builds an exact symbolic representation of SHA-256 using SMT bit-vector expressions and uses the Z3 solver to reason about the unknown input.
 
-For example, a 32-bit target means:
+The implementation is written primarily in Perl, with `Digest::SHA` used as an independent reference implementation and Z3 used for symbolic constraint solving.
+
+---
+
+## 1. Problem Definition
+
+The input consists of:
+
+- `B`: A fixed, known, exactly 80-byte value.
+- `X`: An unknown, exactly 4-byte value.
+- `B || X`: The 84-byte input to the first SHA-256 operation.
+
+The desired output is:
+
+```text
+SHA256(SHA256(B || X))
+```
+
+The final digest must have a configurable number of trailing zero bits.
+
+For example, requiring 32 trailing zero bits means:
 
 ```text
 SHA256(SHA256(B || X)) mod 2^32 = 0
 ```
 
-The primary goal is to explore SHA-256's internal operations mathematically rather than simply brute-forcing all possible values of `X`.
+The unknown value `X` contains 32 bits of information.
 
-The implementation language is Perl, with `Digest::SHA` used as an independent reference implementation. Z3 is used for symbolic bit-vector reasoning.
+The ultimate objective is to construct a symbolic model of the complete operation and allow Z3 to solve for `X`, subject to the desired output constraint.
 
 ---
 
-## 2. Mathematical Background
+## 2. Important SHA-256 Structure
 
 SHA-256 operates on 512-bit (64-byte) blocks.
 
-Its internal state consists of eight 32-bit words:
+### Inner hash
+
+The first hash receives 84 bytes:
 
 ```text
-H0, H1, H2, H3, H4, H5, H6, H7
+B (80 bytes) || X (4 bytes)
 ```
 
-Each compression operation:
+This requires two SHA-256 blocks.
 
-1. Expands 16 input words into a 64-word message schedule.
-2. Performs 64 rounds of SHA-256 transformations.
-3. Adds the resulting working state back into the original state (feed-forward).
+**Block 1:**
 
-All arithmetic is modulo 2^32.
+- Bytes 0–63 of `B`.
+- Entirely known.
 
-The important SHA-256 functions are:
-
-```text
-Ch(x,y,z)  = (x AND y) XOR (NOT x AND z)
-
-Maj(x,y,z) = (x AND y) XOR (x AND z) XOR (y AND z)
-
-Σ0(x) = ROTR(x,2) XOR ROTR(x,13) XOR ROTR(x,22)
-
-Σ1(x) = ROTR(x,6) XOR ROTR(x,11) XOR ROTR(x,25)
-
-σ0(x) = ROTR(x,7) XOR ROTR(x,18) XOR SHR(x,3)
-
-σ1(x) = ROTR(x,17) XOR ROTR(x,19) XOR SHR(x,10)
-```
-
-The message schedule recurrence is:
-
-```text
-W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]
-```
-
-for `t = 16..63`.
-
----
-
-## 3. Input Structure and SHA-256 Padding
-
-### Original input
-
-```text
-B = 80 bytes
-X = 4 bytes
-```
-
-The first SHA-256 receives:
-
-```text
-B || X
-```
-
-Total length:
-
-```text
-84 bytes = 672 bits
-```
-
-### Inner hash: block 1
-
-The first 64 bytes of `B` form the first complete block.
-
-All bytes are known, so this block can be compressed numerically using our Perl implementation.
-
-### Inner hash: block 2
-
-The second block contains:
-
-```text
-B[64..79]   16 known bytes
-X            4 unknown bytes
-0x80         1 padding byte
-0x00        35 zero bytes
-length       8 bytes
-```
-
-The final 64-bit length field represents 672 bits.
-
-In big-endian 32-bit words:
+**Block 2:**
 
 | Word | Contents |
 |---|---|
-| W0-W3 | Final 16 bytes of B |
-| W4 | Unknown 32-bit X |
+| W0–W3 | Final 16 bytes of B |
+| W4 | Unknown 32-bit value X |
 | W5 | `0x80000000` |
-| W6-W14 | Zero |
+| W6–W14 | Zero |
 | W15 | `0x000002A0` |
 
-This block is the first major symbolic target.
+The final word represents the original message length:
+
+```text
+84 bytes × 8 = 672 bits = 0x2A0
+```
+
+The first block is compressed numerically because all of its contents are known. Its resulting state becomes the initial state for the symbolic second-block compression.
 
 ### Outer hash
 
-The inner SHA-256 digest is 32 bytes.
+The outer hash receives the 32-byte inner digest.
 
-The outer SHA-256 receives those 32 bytes and applies standard SHA-256 padding:
+It requires one SHA-256 block:
+
+| Word | Contents |
+|---|---|
+| W0–W7 | Eight words of the inner digest |
+| W8 | `0x80000000` |
+| W9–W14 | Zero |
+| W15 | `0x00000100` |
+
+The final word represents:
 
 ```text
-32 digest bytes
-0x80
-23 zero bytes
-64-bit length = 256 bits
+32 bytes × 8 = 256 bits = 0x100
 ```
 
-This produces one 64-byte block.
-
-The eventual objective is to connect the symbolic inner digest to this outer compression operation.
+The outer hash therefore operates entirely on symbolic values produced by the inner hash.
 
 ---
 
-## 4. Project Structure
-
-Current known project files:
-
-```text
-project/
-│
-├── lib/
-│   └── SHA256/
-│       └── Reverse.pm
-│
-├── t/
-│   ├── reverse_compression.t
-│   ├── symbolic_schedule.t
-│   ├── symbolic_rounds.t
-│   ├── symbolic_feed_forward.t
-│   ├── symbolic_compression_equivalence.t
-│   ├── trailing_zero_bits.t
-│   └── ...
-│
-└── SHA256_RESEARCH_NOTES.md
-```
-
-The exact names of earlier test files may vary according to the working directory.
+## 3. Current Project Structure
 
 The main implementation is:
 
 ```text
-lib/SHA256/Reverse.pm
+lib/
+  SHA256/
+    Reverse.pm
+
+t/
+  symbolic_schedule.t
+  symbolic_rounds.t
+  symbolic_feed_forward.t
+  symbolic_compression_equivalence.t
+  symbolic_inner_hash.t
+  symbolic_prefixes.t
+  symbolic_double_hash.t
 ```
 
-The module exports selected functions through `@EXPORT_OK`.
+The module exports its public functions through `@EXPORT_OK`.
+
+The test suite uses Perl's testing framework and invokes Z3 for symbolic verification tests.
 
 ---
 
-# 5. Completed Development Stages
+## 4. Completed Development Stages
 
-## Stage 1 — Basic SHA-256 Operations
+### Stage A — Symbolic Message Schedule
 
-Implemented the fundamental SHA-256 operations in Perl:
+Implemented the SHA-256 message schedule using SMT-LIB bit-vector expressions.
 
-- `rotr`
-- `add32`
-- `sub32`
-- `ch`
-- `maj`
-- `big_sigma0`
-- `big_sigma1`
-- `small_sigma0`
-- `small_sigma1`
-- `forward_round`
-- `reverse_round`
-- `verify_round`
-
-Also implemented:
-
-- `message_schedule`
-- `compress_block`
-- `pad_message`
-- `sha256_raw`
-- `double_sha256`
-- `double_sha256_custom`
-- `trace_compression`
-- `reverse_compress_block`
-
-The custom SHA-256 implementation was compared against `Digest::SHA` using several test messages, including:
-
-```text
-""
-"abc"
-"HelloWorld"
-"The quick brown fox jumps over the lazy dog"
-100 repeated A characters
-1000 repeated B characters
-```
-
-All comparisons passed.
-
-### Important correction
-
-The original `sub32` implementation accepted only two arguments, although it was being used with multiple subtrahends.
-
-It was corrected to:
-
-```perl
-sub sub32 {
-    my ($result, @values) = @_;
-
-    for my $value (@values) {
-        $result -= $value;
-    }
-
-    return $result & MASK;
-}
-```
-
-All tests passed after this correction.
-
----
-
-## Stage 2 — Trailing Zero Bit Detection
-
-Implemented:
-
-```perl
-has_trailing_zero_bits($digest, $bits)
-```
-
-This function determines whether a 32-byte SHA-256 digest has the requested number of trailing zero bits.
-
-It supports:
-
-```text
-0 through 256 trailing bits
-```
-
-Tests cover:
-
-- Zero bits
-- Whole-byte boundaries
-- Partial-byte boundaries
-- The complete 256-bit digest
-- Invalid inputs
-
-Test file:
-
-```text
-t/trailing_zero_bits.t
-```
-
-All tests pass.
-
----
-
-## Stage 3 — Symbolic Message Schedule
-
-Introduced SMT-LIB bit-vector expression generation.
-
-The symbolic functions include:
+Functions:
 
 ```perl
 smt_bv32
@@ -294,33 +149,25 @@ smt_message_schedule
 smt_second_hash_block_words
 ```
 
-The symbolic message schedule generates the 64 SHA-256 schedule words using 32-bit bit-vector operations.
+The symbolic message schedule implements:
 
-The schedule recurrence is encoded directly into SMT-LIB.
+\[
+W_t = \sigma_1(W_{t-2}) + W_{t-7}
+      + \sigma_0(W_{t-15}) + W_{t-16}
+      \pmod {2^{32}}
+\]
 
-The function:
+The schedule generates all 64 words, `W0` through `W63`.
 
-```perl
-smt_second_hash_block_words($b_tail)
-```
+The helper `smt_second_hash_block_words` constructs the correctly padded second block for the 84-byte inner-hash input, including the symbolic `x_word`.
 
-accepts the final 16 known bytes of `B` and creates the 16 symbolic block words, including the unknown `X` word and padding.
+**Status: Complete. Tests passing.**
 
-The unknown word is represented as an SMT bit-vector expression.
+### Stage B — Symbolic Compression Rounds
 
-Test file:
+Implemented the SHA-256 round operations using SMT-LIB expressions.
 
-```text
-t/symbolic_schedule.t
-```
-
-All tests pass.
-
----
-
-## Stage 4 — Symbolic SHA-256 Rounds
-
-Implemented symbolic versions of the SHA-256 round functions:
+Functions:
 
 ```perl
 smt_ch
@@ -330,85 +177,111 @@ smt_big_sigma1
 smt_compression_rounds
 ```
 
-The symbolic round generator accepts:
-
-- An initial state consisting of eight SMT-LIB expressions.
-- A round count between 1 and 64.
-
-It generates the round state definitions:
+The implementation models the SHA-256 working state:
 
 ```text
-a_0 through h_0
-a_1 through h_1
-...
-a_N through h_N
+a, b, c, d, e, f, g, h
 ```
 
-The implementation references the generated message schedule words and the standard SHA-256 constants.
+Each round uses the corresponding message schedule word and SHA-256 round constant.
 
-Test file:
+The implementation supports a configurable round count from 1 through 64. This will be useful for reduced-round experiments.
 
-```text
-t/symbolic_rounds.t
-```
+**Status: Complete. Tests passing.**
 
-All tests pass.
+### Stage C — Symbolic Feed-Forward and Compression
 
----
+Implemented the feed-forward operation that adds the final working state back to the original compression state.
 
-## Stage 5 — Symbolic Feed-Forward and Compression
-
-Implemented:
+Functions:
 
 ```perl
 smt_feed_forward
 smt_compress_block
 ```
 
-The feed-forward operation combines the final working state with the original initial state.
+The feed-forward operation is:
 
-For example:
+\[
+H'_i = H_i + S_i \pmod {2^{32}}
+\]
 
-```text
-out0 = initial_state[0] + a_final
-out1 = initial_state[1] + b_final
-...
-out7 = initial_state[7] + h_final
-```
+Where:
 
-All additions are 32-bit bit-vector additions, so they automatically wrap modulo 2^32.
+- \(H_i\) is the original state word.
+- \(S_i\) is the final working-state word.
+- \(H'_i\) is the resulting hash state word.
 
-The complete symbolic compression function combines:
+`smt_compress_block` combines the symbolic message schedule, compression rounds, and feed-forward operation.
 
-1. Message schedule generation.
-2. Symbolic round generation.
-3. Feed-forward.
+**Status: Complete. Tests passing.**
 
-Its current interface is:
+### Stage D — Symbolic/Numeric Compression Equivalence
+
+Created a test that compares the symbolic compression implementation against the existing numeric Perl implementation.
+
+The test:
+
+1. Constructs a deterministic 64-byte block.
+2. Compresses the block using the numeric implementation.
+3. Generates an SMT-LIB representation of the same compression.
+4. Runs Z3.
+5. Compares all eight resulting 32-bit state words.
+
+This verifies that the symbolic compression implementation agrees with the numeric implementation.
+
+**Status: Complete. Tests passing.**
+
+### Stage E — Symbolic Inner Hash
+
+Implemented the symbolic inner hash.
+
+Function:
 
 ```perl
-smt_compress_block(
-    $initial_state,
-    $block_words,
-    $round_count
-);
+smt_inner_hash
 ```
 
-### Current naming limitation
+The implementation:
 
-The symbolic functions currently use fixed SMT-LIB names:
+1. Validates that `B` is exactly 80 bytes.
+2. Compresses the first 64 bytes numerically.
+3. Uses the resulting state as the initial state for the second block.
+4. Builds the symbolic second block.
+5. Uses `x_word` as the unknown 32-bit input.
+6. Generates the symbolic compression for the second block.
+
+The resulting symbolic output words are:
 
 ```text
-w0 ... w63
-a_0 ... h_N
-out0 ... out7
+inner_out0
+inner_out1
+inner_out2
+inner_out3
+inner_out4
+inner_out5
+inner_out6
+inner_out7
 ```
 
-This is sufficient for testing one compression block in an SMT-LIB namespace.
+The inner hash test fixes `x_word` to a known value and compares the symbolic output against `Digest::SHA`.
 
-However, multiple symbolic compression blocks cannot yet coexist safely in the same script because their generated names would collide.
+**Status: Complete. Tests passing.**
 
-**Next improvement:** add optional prefixes to the symbolic generators.
+### Supporting Improvement — Symbolic Name Prefixes
+
+Added optional prefixes to the symbolic expression generators.
+
+Updated functions:
+
+```perl
+smt_message_schedule
+smt_compression_rounds
+smt_feed_forward
+smt_compress_block
+```
+
+This allows multiple symbolic compression operations to coexist in one SMT-LIB program without conflicting variable names.
 
 For example:
 
@@ -422,294 +295,314 @@ outer_a_0
 outer_out0
 ```
 
-This will allow the inner and outer SHA-256 computations to coexist in one solver model.
+The prefix is optional, preserving backward compatibility with earlier calls.
 
-Test file:
+Prefix validation also rejects invalid names.
+
+**Status: Implemented. Tests passing.**
+
+### Stage F — Complete Symbolic Double-SHA-256
+
+Implemented the symbolic outer hash and combined double-hash builder.
+
+Functions:
+
+```perl
+smt_outer_hash
+smt_double_hash
+```
+
+`smt_outer_hash`:
+
+1. Uses `inner_out0` through `inner_out7` as its input words.
+2. Adds the correct SHA-256 padding.
+3. Sets the original message length to 256 bits.
+4. Generates the complete symbolic outer compression using the `outer` prefix.
+
+`smt_double_hash`:
+
+1. Validates the 80-byte `B` input.
+2. Generates the symbolic inner hash.
+3. Generates the symbolic outer hash.
+4. Combines both into one SMT-LIB program.
+
+The final symbolic output words are:
 
 ```text
-t/symbolic_feed_forward.t
+outer_out0
+outer_out1
+outer_out2
+outer_out3
+outer_out4
+outer_out5
+outer_out6
+outer_out7
 ```
 
-All tests pass.
-
----
-
-## Stage 6 — Symbolic Compression Equivalence Verification
-
-This stage verifies that the symbolic compression generator produces exactly the same results as the numeric Perl SHA-256 implementation.
-
-The test uses:
-
-- A known SHA-256 initial state.
-- A deterministic 64-byte input block containing bytes 0 through 63.
-- All 16 message words supplied as known constants.
-- All 64 SHA-256 rounds.
-
-The numeric implementation calculates the expected result using:
+The Stage F test fixes `x_word` to a known four-byte value and verifies that all eight symbolic output words match the result from:
 
 ```perl
-compress_block($state, $block);
-```
-
-The symbolic implementation generates SMT-LIB using:
-
-```perl
-smt_compress_block(
-    \@initial_smt,
-    \@block_smt,
-    64
+Digest::SHA::sha256(
+    Digest::SHA::sha256($B . $X)
 );
 ```
 
-Z3 evaluates the symbolic equations and returns:
+This verifies the complete symbolic double-SHA-256 pipeline against an independent implementation.
 
-```text
-out0 out1 out2 out3 out4 out5 out6 out7
-```
-
-The test compares all eight symbolic output words against the numeric result.
-
-Test file:
-
-```text
-t/symbolic_compression_equivalence.t
-```
-
-### Result
-
-**All eight output words match.**
-
-The complete symbolic compression implementation has therefore passed an integration test against the numeric implementation.
-
-The complete test suite also passes.
-
-This is an important milestone: the symbolic SHA-256 compression equations are now validated against our working numeric implementation for the test vector.
+**Status: Complete. Tests passing.**
 
 ---
 
-# 6. Current Development Status
+## 5. Numeric SHA-256 Implementation
 
-| Component | Status |
-|---|---|
-| Numeric SHA-256 implementation | Complete and tested |
-| Numeric double SHA-256 | Complete and tested |
-| Reverse round operations | Implemented and tested |
-| Reverse compression with known schedule | Implemented and tested |
-| Trailing-zero detection | Complete and tested |
-| Symbolic bit-vector primitives | Complete and tested |
-| Symbolic message schedule | Complete and tested |
-| Symbolic SHA-256 rounds | Complete and tested |
-| Symbolic feed-forward | Complete and tested |
-| Symbolic compression | Complete and tested |
-| Symbolic/numeric equivalence test | Passing |
-| Multiple-block SMT naming | Not yet implemented |
-| Two-block symbolic inner hash | Not yet implemented |
-| Symbolic outer hash | Not yet implemented |
-| Trailing-zero constraint in Z3 | Not yet implemented |
-| Solver-based search for X | Not yet implemented |
+The project also contains a numeric SHA-256 implementation used for validation and experimentation.
 
----
-
-# 7. Planned Development Stages
-
-## Stage E — Build the Two-Block Inner Hash
-
-The first block of `B` is entirely known.
-
-We will calculate its resulting SHA-256 state numerically:
+Important functions include:
 
 ```perl
-my $state_after_block_1 = compress_block(
-    \@INITIAL_STATE,
-    $first_64_bytes
-);
+rotr
+add32
+sub32
+ch
+maj
+big_sigma0
+big_sigma1
+small_sigma0
+small_sigma1
+
+forward_round
+reverse_round
+verify_round
+
+message_schedule
+compress_block
+pad_message
+sha256_raw
+double_sha256
+double_sha256_custom
+trace_compression
+reverse_compress_block
+has_trailing_zero_bits
 ```
 
-The second block contains the unknown four-byte `X`.
+The numeric implementation has been tested against `Digest::SHA` using:
 
-We will use the resulting first-block state as the initial state for symbolic compression of the second block.
+- Empty input.
+- `"abc"`.
+- `"HelloWorld"`.
+- The standard quick-brown-fox test string.
+- 100 repeated `A` characters.
+- 1000 repeated `B` characters.
 
-Conceptually:
+All comparisons passed.
+
+The `reverse_round` and `reverse_compress_block` functions provide additional tools for investigating SHA-256's internal operations.
+
+An important distinction: reversing a compression operation when its message schedule and relevant state are known is not the same as recovering an unknown message block. The latter is the actual constraint-solving problem.
+
+---
+
+## 6. Current Verification Status
+
+All completed stages through Stage F have passed their tests.
+
+The complete symbolic pipeline has been verified against the numeric SHA-256 implementation and `Digest::SHA`.
+
+The current model correctly represents:
 
 ```text
-INITIAL_STATE
-      |
-      v
-Numeric compression of B[0..63]
-      |
-      v
-Known intermediate state
-      |
-      v
-Symbolic compression of B[64..79] || X || padding
-      |
-      v
-Symbolic 256-bit inner digest
+80-byte known B
+       |
+       v
+Known first inner block
+       |
+       v
+Numeric intermediate state
+       |
+       v
+Symbolic second inner block
+       |
+       v
+32-byte symbolic inner digest
+       |
+       v
+Symbolic outer block
+       |
+       v
+32-byte symbolic final digest
 ```
 
-This will establish the first complete symbolic hash:
+The remaining work is to add the desired output constraints and experiment with Z3 solving for the unknown input.
+
+---
+
+## 7. Next Development Stages
+
+### Stage G — Trailing-Zero Constraints
+
+Implement a helper that generates SMT-LIB assertions requiring a specified number of trailing zero bits in the final digest.
+
+Proposed function:
+
+```perl
+smt_trailing_zero_constraint($bits)
+```
+
+The helper should support values from 0 through 256.
+
+The final digest is represented by eight big-endian 32-bit words:
 
 ```text
-SHA256(B || X)
+outer_out0 ... outer_out7
 ```
 
-## Stage F — Build the Symbolic Outer Hash
-
-The outer SHA-256 takes the symbolic 256-bit inner digest as its input.
-
-We will construct the outer block using the eight symbolic output words from the inner hash.
-
-The symbolic digest words will be arranged in big-endian order, followed by the outer SHA-256 padding.
-
-The outer compression will use the standard SHA-256 initial state.
-
-The result will be:
-
-```text
-SHA256(SHA256(B || X))
-```
-
-represented entirely as symbolic 32-bit bit-vectors.
-
-This is where the optional naming prefixes become essential.
-
-## Stage G — Add the Trailing-Zero Constraint
-
-Once the complete symbolic double hash is working, we will constrain the final output.
-
-For a target of 32 trailing zero bits:
-
-```text
-out7 = 0
-```
-
-Because SHA-256's digest is represented as eight big-endian 32-bit words, the final word contains the least-significant 32 bits.
-
-For a configurable target of `N` trailing bits, we will construct the appropriate bit-vector constraint.
+The least-significant word is `outer_out7`.
 
 Examples:
 
-| Target | Constraint |
-|---|---|
-| 8 bits | Lowest 8 bits equal zero |
-| 16 bits | Lowest 16 bits equal zero |
-| 24 bits | Lowest 24 bits equal zero |
-| 32 bits | Final 32-bit word equals zero |
-| 40 bits | Final word plus lowest 8 bits of preceding word equal zero |
-
-The solver will be responsible for finding an `X` satisfying the constraint.
-
-## Stage H — Solve for X
-
-The final unknown will be declared as:
+**16 trailing zero bits:**
 
 ```lisp
-(declare-fun x_word () (_ BitVec 32))
+(assert
+  (= ((_ extract 15 0) outer_out7) #x0000)
+)
 ```
 
-The unknown word will feed into the second block of the inner SHA-256.
+**32 trailing zero bits:**
 
-Z3 will attempt to find a value satisfying the requested trailing-zero condition.
-
-If successful, the model's `x_word` value will be extracted and converted into four bytes.
-
-The candidate will then be independently verified using:
-
-```perl
-Digest::SHA
+```lisp
+(assert
+  (= outer_out7 #x00000000)
+)
 ```
 
-The final verification must confirm:
+**40 trailing zero bits:**
 
-1. `X` is exactly four bytes.
-2. The first SHA-256 digest is correct.
-3. The second SHA-256 digest is correct.
-4. The requested number of trailing zero bits is present.
+```lisp
+(assert
+  (= outer_out7 #x00000000)
+)
+(assert
+  (= ((_ extract 7 0) outer_out6) #x00)
+)
+```
+
+**64 trailing zero bits:**
+
+```lisp
+(assert (= outer_out7 #x00000000))
+(assert (= outer_out6 #x00000000))
+```
+
+Tests should verify:
+
+- Zero bits.
+- Partial-word constraints.
+- Exact 32-bit boundaries.
+- Multiple complete words.
+- The maximum of 256 bits.
+- Correct behavior against known numeric digests.
+
+### Stage H — Solve for X
+
+Once the trailing-zero constraints are implemented, construct a complete SMT-LIB problem containing:
+
+1. The symbolic double-hash model.
+2. The unknown 32-bit declaration:
+
+   ```lisp
+   (declare-fun x_word () (_ BitVec 32))
+   ```
+
+3. The requested trailing-zero constraints.
+4. A Z3 `check-sat` command.
+5. A `get-value` command to retrieve `x_word`.
+
+Start with small targets, such as 4, 8, or 12 trailing zero bits, to verify that the solver can find valid inputs.
+
+Then progressively increase the target difficulty.
+
+The final objective is to test whether Z3 can find an `X` satisfying a 32-bit trailing-zero requirement.
 
 ---
 
-# 8. Important Research Considerations
+## 8. Important Research Considerations
 
-## Brute-force complexity
+### This is not ordinary brute force
 
-A four-byte unknown represents:
+The goal is to represent SHA-256's operations as exact bit-vector constraints and allow an SMT solver to reason about the unknown input.
 
-```text
-2^32 = 4,294,967,296 possible values
-```
+This is a constraint-solving approach, not a guarantee that the solver will efficiently invert SHA-256.
 
-For a random 256-bit digest, the probability of finding a digest with `N` trailing zero bits is approximately:
+### Solver complexity
 
-```text
-1 / 2^N
-```
+SHA-256 is designed to resist inversion. Its operations include:
 
-Therefore, a 32-bit trailing-zero target has an expected random-search cost of approximately:
+- 32-bit modular addition.
+- Bitwise rotations.
+- Bitwise shifts.
+- XOR.
+- Choice and majority functions.
+- A nonlinear message schedule.
+- 64 rounds per compression block.
 
-```text
-2^32 attempts
-```
+The complete double-hash model contains 128 compression rounds.
 
-The purpose of this project is to investigate whether the structure of SHA-256 can be exploited through symbolic reasoning to do better than straightforward enumeration.
+Even though the unknown input is only 32 bits, the resulting constraint system can be extremely difficult.
 
-However, a solver may still struggle with the full 64-round SHA-256 construction. Successful symbolic modeling does not guarantee that Z3 can solve the complete problem efficiently.
+The probability of a random digest having `N` trailing zero bits is:
 
-Reduced-round experiments may be useful for understanding solver behavior and identifying bottlenecks.
+\[
+P = 2^{-N}
+\]
 
-## Reverse compression versus inversion
+A 32-bit trailing-zero requirement therefore has an expected random-search work factor of approximately \(2^{32}\) trials.
 
-The existing reverse compression functionality can reverse a compression operation when the necessary message schedule and intermediate information are known.
+SMT solving may exploit the structure of the equations, but there is no guarantee it will outperform random search for the full SHA-256 problem.
 
-That does not mean SHA-256 can be straightforwardly inverted when the message contains unknown bits.
+### Reduced-round experiments
 
-The symbolic solver approach is intended to handle those unknown bits by representing the SHA-256 operations as bit-vector constraints.
+The symbolic compression functions support configurable round counts.
 
----
+This provides an opportunity to investigate:
 
-# 9. Development Philosophy
+- Whether Z3 can solve reduced-round SHA-256.
+- How solving time changes as rounds are added.
+- Whether the inner or outer hash is responsible for most of the difficulty.
+- How different trailing-zero requirements affect solver performance.
 
-The project should continue in small, verifiable stages.
-
-For each stage:
-
-1. Implement a small set of functions.
-2. Add a dedicated Perl test.
-3. Run the dedicated test.
-4. Run the complete test suite.
-5. Verify the result before proceeding.
-
-Where possible, compare symbolic results against the existing numeric implementation.
-
-Do not introduce the complete double-hash solver until each individual compression component has been validated.
-
-The ultimate goal is not merely to produce an answer, but to understand whether and how the internal mathematical structure of SHA-256 can be exploited.
+Reduced-round success should be treated as an experimental result, not proof that full SHA-256 can be inverted efficiently.
 
 ---
 
-# 10. Immediate Next Steps
+## 9. Development Environment
 
-The next development session should begin with:
+Current implementation:
 
-**Stage E preparation: introduce optional naming prefixes into the symbolic functions.**
+- Language: Perl
+- Numeric reference: `Digest::SHA`
+- Symbolic representation: SMT-LIB bit-vectors
+- Constraint solver: Z3
+- Tests: Perl `Test::More` / `prove`
 
-The functions requiring prefix support are:
+Run the full test suite with:
 
-```perl
-smt_message_schedule
-smt_compression_rounds
-smt_feed_forward
-smt_compress_block
+```bash
+prove -v t/
 ```
 
-The prefix should be optional so that existing tests and callers continue to work with the current default names.
+Run an individual test with:
 
-After prefix support is implemented and tested, we will:
+```bash
+prove -v t/symbolic_double_hash.t
+```
 
-1. Calculate the first 64-byte block of `B` numerically.
-2. Use the resulting state as the initial state for the symbolic second block.
-3. Introduce `x_word` as the unknown 32-bit value.
-4. Verify the symbolic inner hash against the numeric implementation using a known test value for `X`.
+---
 
-At that point, we will have a complete symbolic model of the first SHA-256 operation.
+## 10. Current Milestone
 
-**Current milestone: Stages 1–6 are complete, and the full test suite passes.**
+**Completed:** Exact symbolic representation of the complete double-SHA-256 pipeline, verified against independent numeric implementations.
+
+**Next:** Add final-digest trailing-zero constraints and begin solving for the unknown 32-bit input.
+
+The project has successfully moved from implementing individual SHA-256 operations to representing the complete double-hash operation as a single symbolic constraint system.

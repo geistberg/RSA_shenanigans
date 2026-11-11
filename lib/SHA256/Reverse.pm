@@ -41,6 +41,9 @@ our @EXPORT_OK = qw(
 	smt_compression_rounds
 	smt_feed_forward
 	smt_compress_block
+	smt_inner_hash
+	smt_outer_hash
+	smt_double_hash
 );
 
 use constant MASK => 0xFFFFFFFF;
@@ -1018,6 +1021,111 @@ sub smt_compress_block {
         $rounds,
         $feed_forward
     );
+}
+
+sub smt_inner_hash {
+    my ($b) = @_;
+
+    die "B must be exactly 80 bytes\n"
+        unless defined($b) && length($b) == 80;
+
+    # --------------------------------------------------------
+    # Block 1: all 64 bytes are known.
+    # Compress numerically to obtain the intermediate state.
+    # --------------------------------------------------------
+
+    my $first_block = substr($b, 0, 64);
+
+    my $state_after_block_1 = compress_block(
+        \@INITIAL_STATE,
+        $first_block
+    );
+
+    # --------------------------------------------------------
+    # Block 2: the final 16 bytes of B, unknown X, and padding.
+    # --------------------------------------------------------
+
+    my $b_tail = substr($b, 64, 16);
+
+    my $second_block_words = smt_second_hash_block_words(
+        $b_tail
+    );
+
+    # Convert the known intermediate state into SMT constants.
+    my @symbolic_initial_state = map {
+        smt_bv32($_)
+    } @$state_after_block_1;
+
+    # --------------------------------------------------------
+    # Generate the symbolic second compression.
+    # --------------------------------------------------------
+
+    my $symbolic_compression = smt_compress_block(
+        \@symbolic_initial_state,
+        $second_block_words,
+        64,
+        'inner'
+    );
+
+    # --------------------------------------------------------
+    # Declare the unknown four-byte word.
+    # --------------------------------------------------------
+
+    return join(
+        "\n",
+        '(declare-fun x_word () (_ BitVec 32))',
+        $symbolic_compression
+    ) . "\n";
+}
+
+sub smt_outer_hash {
+
+    # The inner digest is already represented as eight
+    # symbolic big-endian 32-bit words.
+    my @block_words = map {
+        "inner_out$_"
+    } (0..7);
+
+    # SHA-256 padding for a 32-byte message.
+    push @block_words, "#x80000000";
+
+    push @block_words, ("#x00000000") x 6;
+
+    # Original message length: 32 bytes * 8 = 256 bits.
+    push @block_words, "#x00000100";
+
+    die "Internal error: expected exactly 16 outer block words\n"
+        unless @block_words == 16;
+
+    # The outer hash always begins with the standard SHA-256
+    # initial state.
+    my @initial_state = map {
+        smt_bv32($_)
+    } @INITIAL_STATE;
+
+    return smt_compress_block(
+        \@initial_state,
+        \@block_words,
+        64,
+        'outer'
+    );
+}
+
+sub smt_double_hash {
+    my ($b) = @_;
+
+    die "B must be exactly 80 bytes\n"
+        unless defined($b) && length($b) == 80;
+
+    my $inner = smt_inner_hash($b);
+
+    my $outer = smt_outer_hash();
+
+    return join(
+        "\n",
+        $inner,
+        $outer
+    ) . "\n";
 }
 
 1;
