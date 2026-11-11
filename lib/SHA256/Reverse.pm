@@ -623,7 +623,17 @@ sub smt_small_sigma1 {
 # The first 16 words are supplied by the caller.
 # The remaining 48 are generated using the SHA-256 recurrence.
 sub smt_message_schedule {
-    my ($initial_words) = @_;
+    my ($initial_words, $prefix) = @_;
+
+    $prefix //= '';
+
+    die "Invalid SMT prefix\n"
+        if length($prefix)
+        && $prefix !~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    my $name_prefix = length($prefix)
+        ? $prefix . '_'
+        : '';
 
     die "Initial words must be an array reference\n"
         unless ref($initial_words) eq 'ARRAY';
@@ -641,28 +651,37 @@ sub smt_message_schedule {
 
     # Define the first 16 words.
     for my $i (0..15) {
+        my $word_name = $name_prefix . "w$i";
+
         push @definitions,
-            "(define-fun w$i () (_ BitVec 32) " .
+            "(define-fun $word_name () (_ BitVec 32) " .
             $initial_words->[$i] .
             ")";
     }
 
     # Expand the schedule through word 63.
     for my $i (16..63) {
-        my $sigma0 = smt_small_sigma0("w" . ($i - 15));
-        my $sigma1 = smt_small_sigma1("w" . ($i - 2));
+        my $previous_15 = $name_prefix . "w" . ($i - 15);
+        my $previous_2  = $name_prefix . "w" . ($i - 2);
+        my $previous_7  = $name_prefix . "w" . ($i - 7);
+        my $previous_16 = $name_prefix . "w" . ($i - 16);
+
+        my $sigma0 = smt_small_sigma0($previous_15);
+        my $sigma1 = smt_small_sigma1($previous_2);
 
         my $expression =
             "(bvadd " .
                 "(bvadd " .
-                    "(bvadd $sigma1 w" . ($i - 7) . ")" .
+                    "(bvadd $sigma1 $previous_7)" .
                     " $sigma0" .
                 ")" .
-                " w" . ($i - 16) .
+                " $previous_16" .
             ")";
 
+        my $word_name = $name_prefix . "w$i";
+
         push @definitions,
-            "(define-fun w$i () (_ BitVec 32) $expression)";
+            "(define-fun $word_name () (_ BitVec 32) $expression)";
     }
 
     return join("\n", @definitions) . "\n";
@@ -767,7 +786,17 @@ sub smt_big_sigma1 {
 # Returns:
 #   SMT-LIB define-fun declarations for every round state.
 sub smt_compression_rounds {
-    my ($initial_state, $round_count) = @_;
+    my ($initial_state, $round_count, $prefix) = @_;
+
+    $prefix //= '';
+
+    die "Invalid SMT prefix\n"
+        if length($prefix)
+        && $prefix !~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    my $name_prefix = length($prefix)
+        ? $prefix . '_'
+        : '';
 
     die "Initial state must be an array reference\n"
         unless ref($initial_state) eq 'ARRAY';
@@ -787,7 +816,10 @@ sub smt_compression_rounds {
             && length($initial_state->[$i]);
     }
 
-    my @names = qw(a b c d e f g h);
+    my @names = map {
+        $name_prefix . $_
+    } qw(a b c d e f g h);
+
     my @definitions;
 
     # Define the initial working state.
@@ -800,17 +832,19 @@ sub smt_compression_rounds {
 
     # Generate the requested number of rounds.
     for my $t (0..$round_count - 1) {
-        my $a = "a_$t";
-        my $b = "b_$t";
-        my $c = "c_$t";
-        my $d = "d_$t";
-        my $e = "e_$t";
-        my $f = "f_$t";
-        my $g = "g_$t";
-        my $h = "h_$t";
+        my $a = $names[0] . "_$t";
+        my $b = $names[1] . "_$t";
+        my $c = $names[2] . "_$t";
+        my $d = $names[3] . "_$t";
+        my $e = $names[4] . "_$t";
+        my $f = $names[5] . "_$t";
+        my $g = $names[6] . "_$t";
+        my $h = $names[7] . "_$t";
 
         my $sigma1 = smt_big_sigma1($e);
         my $choice = smt_ch($e, $f, $g);
+
+        my $schedule_word = $name_prefix . "w$t";
 
         my $t1 = "(bvadd " .
             "(bvadd " .
@@ -820,7 +854,7 @@ sub smt_compression_rounds {
                 ") " .
                 smt_bv32($K[$t]) .
             ") " .
-            "w$t" .
+            $schedule_word .
         ")";
 
         my $t2 = "(bvadd " .
@@ -870,7 +904,17 @@ sub smt_compression_rounds {
 #
 # All additions are 32-bit modular additions.
 sub smt_feed_forward {
-    my ($initial_state, $round_count) = @_;
+    my ($initial_state, $round_count, $prefix) = @_;
+
+    $prefix //= '';
+
+    die "Invalid SMT prefix\n"
+        if length($prefix)
+        && $prefix !~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    my $name_prefix = length($prefix)
+        ? $prefix . '_'
+        : '';
 
     die "Initial state must be an array reference\n"
         unless ref($initial_state) eq 'ARRAY';
@@ -890,15 +934,20 @@ sub smt_feed_forward {
             && length($initial_state->[$i]);
     }
 
-    my @names = qw(a b c d e f g h);
+    my @names = map {
+        $name_prefix . $_
+    } qw(a b c d e f g h);
+
     my @definitions;
 
     for my $i (0..7) {
         my $final_working_word =
             $names[$i] . "_" . $round_count;
 
+        my $output_name = $name_prefix . "out$i";
+
         push @definitions,
-            "(define-fun out$i () (_ BitVec 32) " .
+            "(define-fun $output_name () (_ BitVec 32) " .
             "(bvadd " .
                 $initial_state->[$i] . " " .
                 $final_working_word .
@@ -907,7 +956,6 @@ sub smt_feed_forward {
 
     return join("\n", @definitions) . "\n";
 }
-
 
 # Generate a complete symbolic SHA-256 compression block.
 #
@@ -921,7 +969,13 @@ sub smt_feed_forward {
 # This function assumes that the generated block is the only
 # compression block in the current SMT-LIB namespace.
 sub smt_compress_block {
-    my ($initial_state, $block_words, $round_count) = @_;
+    my ($initial_state, $block_words, $round_count, $prefix) = @_;
+
+    $prefix //= '';
+
+    die "Invalid SMT prefix\n"
+        if length($prefix)
+        && $prefix !~ /^[A-Za-z_][A-Za-z0-9_]*$/;
 
     die "Initial state must be an array reference\n"
         unless ref($initial_state) eq 'ARRAY';
@@ -941,16 +995,21 @@ sub smt_compress_block {
         && $round_count >= 1
         && $round_count <= 64;
 
-    my $schedule = smt_message_schedule($block_words);
+    my $schedule = smt_message_schedule(
+        $block_words,
+        $prefix
+    );
 
     my $rounds = smt_compression_rounds(
         $initial_state,
-        $round_count
+        $round_count,
+        $prefix
     );
 
     my $feed_forward = smt_feed_forward(
         $initial_state,
-        $round_count
+        $round_count,
+        $prefix
     );
 
     return join(
@@ -960,6 +1019,5 @@ sub smt_compress_block {
         $feed_forward
     );
 }
-
 
 1;
