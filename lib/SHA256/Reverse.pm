@@ -21,6 +21,8 @@ our @EXPORT_OK = qw(
     verify_round
 	message_schedule
 	compress_block
+	compress_block_rounds
+	double_sha256_reduced
 	pad_message
 	sha256_raw
 	double_sha256_custom
@@ -44,6 +46,7 @@ our @EXPORT_OK = qw(
 	smt_inner_hash
 	smt_outer_hash
 	smt_double_hash
+	smt_trailing_zero_constraint
 );
 
 use constant MASK => 0xFFFFFFFF;
@@ -385,6 +388,104 @@ sub compress_block {
     }
 
     return \@result;
+}
+
+sub compress_block_rounds {
+    my ($state, $block, $round_count, $trace) = @_;
+
+    die "Invalid SHA-256 state\n"
+        unless ref($state) eq 'ARRAY' && @$state == 8;
+
+    die "Block must be exactly 64 bytes\n"
+        unless defined($block) && length($block) == 64;
+
+    die "Round count must be between 1 and 64\n"
+        unless defined($round_count)
+            && $round_count =~ /^\d+$/
+            && $round_count >= 1
+            && $round_count <= 64;
+
+    my $w = message_schedule($block);
+
+    my @initial = @$state;
+    my @working = @$state;
+
+    for my $i (0 .. $round_count - 1) {
+        @working = @{forward_round(\@working, $w->[$i], $K[$i])};
+
+        if (defined $trace) {
+            push @$trace, [@working];
+        }
+    }
+
+    my @result;
+
+    for my $i (0 .. 7) {
+        $result[$i] = add32($initial[$i], $working[$i]);
+    }
+
+    return \@result;
+}
+
+sub double_sha256_reduced {
+    my ($b, $x, $inner_rounds, $outer_rounds) = @_;
+
+    die "B must be exactly 80 bytes\n"
+        unless defined($b) && length($b) == 80;
+
+    die "X must be exactly 4 bytes\n"
+        unless defined($x) && length($x) == 4;
+
+    die "Inner rounds must be between 1 and 64\n"
+        unless defined($inner_rounds)
+            && $inner_rounds =~ /^\d+$/
+            && $inner_rounds >= 1
+            && $inner_rounds <= 64;
+
+    die "Outer rounds must be between 1 and 64\n"
+        unless defined($outer_rounds)
+            && $outer_rounds =~ /^\d+$/
+            && $outer_rounds >= 1
+            && $outer_rounds <= 64;
+
+    # First inner block: standard 64-round SHA-256.
+    my $first_block = substr($b, 0, 64);
+
+    my $state = compress_block(
+        \@INITIAL_STATE,
+        $first_block
+    );
+
+    # Second inner block: configurable number of rounds.
+    my $second_block =
+          substr($b, 64, 16)
+        . $x
+        . "\x80"
+        . ("\x00" x 35)
+        . pack("NN", 0, 672);
+
+    $state = compress_block_rounds(
+        $state,
+        $second_block,
+        $inner_rounds
+    );
+
+    my $inner_digest = pack("N8", @$state);
+
+    # Outer block: configurable number of rounds.
+    my $outer_block =
+          $inner_digest
+        . "\x80"
+        . ("\x00" x 23)
+        . pack("NN", 0, 256);
+
+    my $outer_state = compress_block_rounds(
+        \@INITIAL_STATE,
+        $outer_block,
+        $outer_rounds
+    );
+
+    return pack("N8", @$outer_state);
 }
 
 # -----------------------------------------
@@ -1024,7 +1125,14 @@ sub smt_compress_block {
 }
 
 sub smt_inner_hash {
-    my ($b) = @_;
+    my ($b, $round_count) = @_;
+
+    $round_count = 64 unless defined $round_count;
+
+    die "Round count must be an integer from 1 to 64\n"
+        unless $round_count =~ /^\d+$/
+            && $round_count >= 1
+            && $round_count <= 64;
 
     die "B must be exactly 80 bytes\n"
         unless defined($b) && length($b) == 80;
@@ -1060,12 +1168,12 @@ sub smt_inner_hash {
     # Generate the symbolic second compression.
     # --------------------------------------------------------
 
-    my $symbolic_compression = smt_compress_block(
-        \@symbolic_initial_state,
-        $second_block_words,
-        64,
-        'inner'
-    );
+	my $symbolic_compression = smt_compress_block(
+    	\@symbolic_initial_state,
+    	$second_block_words,
+    	$round_count,
+    	'inner'
+	);
 
     # --------------------------------------------------------
     # Declare the unknown four-byte word.
@@ -1079,6 +1187,14 @@ sub smt_inner_hash {
 }
 
 sub smt_outer_hash {
+	my ($round_count) = @_;
+
+    $round_count = 64 unless defined $round_count;
+
+    die "Round count must be an integer from 1 to 64\n"
+        unless $round_count =~ /^\d+$/
+            && $round_count >= 1
+            && $round_count <= 64;
 
     # The inner digest is already represented as eight
     # symbolic big-endian 32-bit words.
@@ -1106,26 +1222,73 @@ sub smt_outer_hash {
     return smt_compress_block(
         \@initial_state,
         \@block_words,
-        64,
+        $round_count,
         'outer'
     );
 }
 
 sub smt_double_hash {
-    my ($b) = @_;
+	my ($b, $inner_rounds, $outer_rounds) = @_;
 
     die "B must be exactly 80 bytes\n"
         unless defined($b) && length($b) == 80;
 
-    my $inner = smt_inner_hash($b);
+    $inner_rounds = 64 unless defined $inner_rounds;
+    $outer_rounds = 64 unless defined $outer_rounds;
 
-    my $outer = smt_outer_hash();
+    my $inner = smt_inner_hash($b, $inner_rounds);
+    my $outer = smt_outer_hash($outer_rounds);
 
-    return join(
-        "\n",
-        $inner,
-        $outer
-    ) . "\n";
+    return join("\n", $inner, $outer) . "\n";
+}
+
+sub smt_trailing_zero_constraint {
+    my ($bits, $prefix) = @_;
+
+    die "Trailing zero bit count must be an integer from 0 to 256\n"
+        unless defined($bits)
+            && !ref($bits)
+            && $bits =~ /^\d+$/
+            && $bits <= 256;
+
+    $prefix = 'outer' unless defined $prefix;
+
+    die "Invalid SMT name prefix\n"
+        unless $prefix eq ''
+            || $prefix =~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    my $name_prefix = length($prefix) ? $prefix . '_' : '';
+
+    my @assertions;
+    my $remaining = $bits;
+
+    # Start at the least-significant word and work backwards.
+    for my $word_index (reverse 0..7) {
+        last if $remaining == 0;
+
+        my $word_name = $name_prefix . "out$word_index";
+
+        if ($remaining >= 32) {
+            # Require the entire 32-bit word to be zero.
+            push @assertions,
+                "(assert (= $word_name #x00000000))";
+
+            $remaining -= 32;
+        }
+        else {
+            # Require only the least-significant remaining bits to be zero.
+            my $width = $remaining;
+            my $high_bit = $width - 1;
+
+            push @assertions,
+                "(assert (= ((_ extract $high_bit 0) $word_name) (_ bv0 $width)))";
+
+            $remaining = 0;
+        }
+    }
+
+    return join("\n", @assertions)
+        . (@assertions ? "\n" : "");
 }
 
 1;
