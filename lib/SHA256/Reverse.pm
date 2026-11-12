@@ -35,6 +35,7 @@ our @EXPORT_OK = qw(
 	smt_small_sigma0
 	smt_small_sigma1
 	smt_message_schedule
+	smt_inner_message_schedule
 	smt_second_hash_block_words
 	smt_ch
 	smt_maj
@@ -791,6 +792,123 @@ sub smt_message_schedule {
     return join("\n", @definitions) . "\n";
 }
 
+
+sub smt_inner_message_schedule {
+    my ($b_tail, $prefix) = @_;
+
+    $prefix //= '';
+
+    die "Invalid SMT prefix\n"
+        if length($prefix)
+        && $prefix !~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    my $name_prefix = length($prefix)
+        ? $prefix . '_'
+        : '';
+
+    die "B tail must be exactly 16 bytes\n"
+        unless defined($b_tail) && length($b_tail) == 16;
+
+    # First 16 message-schedule words.
+    my @values = unpack("N4", $b_tail);
+
+    push @values, undef;             # W4 = x_word
+    push @values, 0x80000000;        # W5 = padding
+    push @values, (0) x 9;           # W6-W14
+    push @values, 0x000002a0;        # W15 = 672 bits
+
+    # Expressions are populated only for symbolic words.
+    my @expressions;
+
+    for my $i (0..15) {
+        $expressions[$i] = defined($values[$i])
+            ? smt_bv32($values[$i])
+            : "x_word";
+    }
+
+    my @definitions;
+
+	# Expand the schedule through word 63.
+    for my $i (16..63) {
+        my $i15 = $i - 15;
+        my $i2  = $i - 2;
+        my $i7  = $i - 7;
+        my $i16 = $i - 16;
+
+        my @dependencies = ($i15, $i2, $i7, $i16);
+
+        my $all_numeric = !grep {
+            !defined($values[$_])
+        } @dependencies;
+
+        my $word_name = $name_prefix . "w$i";
+        my $expression;
+
+        if ($all_numeric) {
+            # Calculate this schedule word in Perl.
+            my $value = (
+                small_sigma1($values[$i2]) +
+                $values[$i7] +
+                small_sigma0($values[$i15]) +
+                $values[$i16]
+            ) & MASK;
+
+			$values[$i] = $value;
+            $expression = smt_bv32($value);
+            $expressions[$i] = $word_name;
+        }
+        else {
+            # At least one dependency is symbolic.
+            my $sigma0 = smt_small_sigma0(
+                $name_prefix . "w$i15"
+            );
+
+            my $sigma1 = smt_small_sigma1(
+                $name_prefix . "w$i2"
+            );
+
+            $expression =
+                "(bvadd " .
+                    "(bvadd " .
+                        "(bvadd $sigma1 " .
+                            $expressions[$i7] .
+                        ") " .
+                        "$sigma0" .
+                    ") " .
+                    $expressions[$i16] .
+                ")";
+
+            $values[$i] = undef;
+            $expressions[$i] = $word_name;
+        }
+
+        # Every schedule word must have an SMT definition,
+        # whether calculated numerically or symbolically.
+        push @definitions,
+            "(define-fun $word_name () (_ BitVec 32) " .
+            $expression .
+            ")";
+    }
+
+    # Declare the constant initial words and symbolic schedule words.
+    my @initial_definitions;
+
+    for my $i (0..15) {
+        my $word_name = $name_prefix . "w$i";
+
+        push @initial_definitions,
+            "(define-fun $word_name () (_ BitVec 32) " .
+            $expressions[$i] .
+            ")";
+    }
+
+    return join(
+        "\n",
+        @initial_definitions,
+        @definitions
+    ) . "\n";
+}
+
 # Construct the exact second block of SHA256(B || X).
 #
 # b_tail:
@@ -1155,25 +1273,39 @@ sub smt_inner_hash {
 
     my $b_tail = substr($b, 64, 16);
 
-    my $second_block_words = smt_second_hash_block_words(
-        $b_tail
-    );
-
     # Convert the known intermediate state into SMT constants.
     my @symbolic_initial_state = map {
         smt_bv32($_)
     } @$state_after_block_1;
 
-    # --------------------------------------------------------
-    # Generate the symbolic second compression.
-    # --------------------------------------------------------
+    # Generate the specialized message schedule.
+    # The final 16 bytes of B are known, so only x_word is symbolic.
+    my $symbolic_schedule = smt_inner_message_schedule(
+        $b_tail,
+        'inner'
+    );
 
-	my $symbolic_compression = smt_compress_block(
-    	\@symbolic_initial_state,
-    	$second_block_words,
-    	$round_count,
-    	'inner'
-	);
+    # Generate the symbolic compression rounds.
+    my $symbolic_rounds = smt_compression_rounds(
+        \@symbolic_initial_state,
+        $round_count,
+        'inner'
+    );
+
+    # Generate the feed-forward operation.
+    my $symbolic_feed_forward = smt_feed_forward(
+        \@symbolic_initial_state,
+        $round_count,
+        'inner'
+    );
+
+    # Assemble the complete symbolic compression.
+    my $symbolic_compression = join(
+        "\n",
+        $symbolic_schedule,
+        $symbolic_rounds,
+        $symbolic_feed_forward
+    );
 
     # --------------------------------------------------------
     # Declare the unknown four-byte word.
