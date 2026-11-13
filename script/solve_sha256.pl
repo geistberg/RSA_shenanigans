@@ -9,6 +9,7 @@ use lib "$FindBin::Bin/../lib";
 
 use Digest::SHA qw(sha256);
 use File::Temp qw(tempfile);
+use Time::HiRes qw(time);
 
 use SHA256::Reverse qw(
     smt_double_hash
@@ -81,7 +82,11 @@ print "Building symbolic double-SHA-256 model...\n";
 # Generate the SMT-LIB problem
 # ------------------------------------------------------------
 
+my $start_time = time();
+
 my $smt = smt_double_hash($B, $inner_rounds, $outer_rounds);
+
+printf "Model generation time: %.2f seconds\n", time() - $start_time;
 
 my ($smt_fh, $smt_file) = tempfile(
     SUFFIX => '.smt2',
@@ -91,6 +96,8 @@ my ($smt_fh, $smt_file) = tempfile(
 print {$smt_fh} "(set-logic QF_BV)\n";
 print {$smt_fh} "(set-option :produce-models true)\n";
 print {$smt_fh} "(set-option :timeout $timeout_ms)\n";
+print {$smt_fh} "(set-option :sat.random_seed 1)\n";
+print {$smt_fh} "(set-option :smt.random_seed 1)\n";
 
 print {$smt_fh} $smt;
 
@@ -113,6 +120,8 @@ close $smt_fh
 
 print "Asking Z3 to find X...\n";
 
+my $z3_start_time = time();
+
 open my $z3_fh, '-|', 'z3', '-st', '-smt2', $smt_file
     or die "Unable to execute Z3: $!\n";
 
@@ -123,6 +132,8 @@ my $output;
 }
 
 close $z3_fh;
+
+printf "Z3 execution time: %.2f seconds\n", time() - $z3_start_time;
 
 print "\nZ3 output:\n";
 print $output;
